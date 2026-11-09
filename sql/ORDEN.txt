@@ -1,0 +1,31 @@
+orden de ejecucion de scripts (sql developer, ejecutar como script con f5)
+
+  #   script                         conectado como
+  1   00_seguridad_admin.sql         ADMIN
+  2   01_secuencias.sql              FIDE_CS_OWNER
+  3   02_tablas.sql                  FIDE_CS_OWNER
+  4   03_restricciones.sql           FIDE_CS_OWNER
+  5   04_indices.sql                 FIDE_CS_OWNER
+  6   05_paquetes_base.sql           FIDE_CS_OWNER
+  7   06_funciones.sql               FIDE_CS_OWNER
+  8   07_vistas.sql                  FIDE_CS_OWNER
+  9   08_procedimientos.sql          FIDE_CS_OWNER
+ 10   09_paquetes.sql                FIDE_CS_OWNER
+ 11   10_triggers.sql                FIDE_CS_OWNER
+ 12   11_datos_prueba.sql            FIDE_CS_OWNER
+ 13   12_job_sla.sql                 FIDE_CS_OWNER
+ 14   13_privilegios.sql             FIDE_CS_OWNER
+ 15   14_sinonimos_auditoria.sql     ADMIN
+ 16   15_pruebas_app.sql             FIDE_CS_APP
+ 17   16_prueba_concurrencia.sql     FIDE_CS_DEV y FIDE_CS_APP en dos sesiones
+
+reinstalar desde cero: 99_limpieza.sql como ADMIN y repetir desde el paso 1
+
+contrasenas iniciales de los esquemas (cambiarlas si se desea en 00_seguridad_admin.sql y en el .env):
+  FIDE_CS_OWNER  faster@Password123
+  FIDE_CS_DEV    faster@Password123
+  FIDE_CS_APP    faster@Password123
+
+usuarios de prueba de la aplicacion (contrasena de todos: Cyber2026!)
+  lmora (Administrador), cvargas y ajimenez (Supervisor), arodriguez, dchaves, mcampos, jsolano (Analista),
+  kfallas (Analista inactivo), pnunez (Auditor)

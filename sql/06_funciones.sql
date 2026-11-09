@@ -1,0 +1,273 @@
+-- ejecutar como fide_cs_owner
+
+-- fecha y hora actual de la base sin zona horaria
+CREATE OR REPLACE FUNCTION FIDE_AHORA_FN RETURN TIMESTAMP IS
+BEGIN
+  RETURN CAST(SYSTIMESTAMP AS TIMESTAMP);
+END FIDE_AHORA_FN;
+/
+
+-- hash sha256 de la contrasena con el usuario como sal
+CREATE OR REPLACE FUNCTION FIDE_HASH_CONTRASENA_FN (
+  p_nombre_usuario IN VARCHAR2,
+  p_contrasena     IN VARCHAR2
+) RETURN VARCHAR2 IS
+  v_hash VARCHAR2(64);
+BEGIN
+  IF p_contrasena IS NULL OR LENGTH(p_contrasena) < 8 THEN
+    RAISE_APPLICATION_ERROR(FIDE_ERRORES_PKG.c_dato_invalido, 'la contrasena debe tener al menos 8 caracteres');
+  END IF;
+  SELECT RAWTOHEX(STANDARD_HASH(LOWER(p_nombre_usuario) || ':' || p_contrasena, 'SHA256'))
+    INTO v_hash
+    FROM DUAL;
+  RETURN v_hash;
+END FIDE_HASH_CONTRASENA_FN;
+/
+
+-- rn-12 y tabla iv: severidad segun puntaje cvss
+CREATE OR REPLACE FUNCTION FIDE_CALCULAR_SEVERIDAD_FN (
+  p_cvss IN NUMBER
+) RETURN NUMBER IS
+  v_id_severidad FIDE_SEVERIDAD_TB.ID_SEVERIDAD%TYPE;
+BEGIN
+  IF p_cvss IS NULL OR p_cvss < 0 OR p_cvss > 10 THEN
+    RAISE_APPLICATION_ERROR(FIDE_ERRORES_PKG.c_cvss_fuera_rango, 'el puntaje cvss debe estar entre 0.0 y 10.0');
+  END IF;
+  SELECT ID_SEVERIDAD
+    INTO v_id_severidad
+    FROM FIDE_SEVERIDAD_TB
+   WHERE ID_ESTADO = 1
+     AND ROUND(p_cvss, 1) BETWEEN CVSS_MINIMO AND CVSS_MAXIMO
+   ORDER BY CVSS_MINIMO DESC
+   FETCH FIRST 1 ROWS ONLY;
+  RETURN v_id_severidad;
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    SELECT ID_SEVERIDAD
+      INTO v_id_severidad
+      FROM FIDE_SEVERIDAD_TB
+     WHERE ID_ESTADO = 1
+     ORDER BY CVSS_MINIMO
+     FETCH FIRST 1 ROWS ONLY;
+    RETURN v_id_severidad;
+END FIDE_CALCULAR_SEVERIDAD_FN;
+/
+
+-- rn-01: severidad del incidente segun vulnerabilidad o activo
+CREATE OR REPLACE FUNCTION FIDE_SEVERIDAD_INCIDENTE_FN (
+  p_id_activo         IN NUMBER,
+  p_id_vulnerabilidad IN NUMBER
+) RETURN NUMBER IS
+  v_cvss FIDE_CVE_TB.PUNTAJE_CVSS%TYPE;
+  v_id_media FIDE_SEVERIDAD_TB.ID_SEVERIDAD%TYPE;
+BEGIN
+  IF p_id_vulnerabilidad IS NOT NULL THEN
+    BEGIN
+      SELECT C.PUNTAJE_CVSS
+        INTO v_cvss
+        FROM FIDE_VULNERABILIDAD_TB V
+        JOIN FIDE_CVE_TB C ON C.ID_CVE = V.ID_CVE
+       WHERE V.ID_VULNERABILIDAD = p_id_vulnerabilidad
+         AND V.ID_ACTIVO = p_id_activo;
+    EXCEPTION
+      WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(FIDE_ERRORES_PKG.c_vuln_no_pertenece, 'la vulnerabilidad no existe o no pertenece al activo');
+    END;
+  ELSE
+    SELECT MAX(C.PUNTAJE_CVSS)
+      INTO v_cvss
+      FROM FIDE_VULNERABILIDAD_TB V
+      JOIN FIDE_CVE_TB C ON C.ID_CVE = V.ID_CVE
+      JOIN FIDE_ESTADO_VULNERABILIDAD_TB E ON E.ID_ESTADO_VULNERABILIDAD = V.ID_ESTADO_VULNERABILIDAD
+     WHERE V.ID_ACTIVO = p_id_activo
+       AND E.NOMBRE_ESTADO NOT IN ('Mitigada', 'Falso positivo');
+  END IF;
+
+  IF v_cvss IS NULL THEN
+    SELECT ID_SEVERIDAD INTO v_id_media FROM FIDE_SEVERIDAD_TB WHERE NOMBRE_SEVERIDAD = 'Media';
+    RETURN v_id_media;
+  END IF;
+  RETURN FIDE_CALCULAR_SEVERIDAD_FN(v_cvss);
+END FIDE_SEVERIDAD_INCIDENTE_FN;
+/
+
+-- cantidad de incidentes no cerrados de un analista
+CREATE OR REPLACE FUNCTION FIDE_CARGA_ANALISTA_FN (
+  p_id_usuario IN NUMBER
+) RETURN NUMBER IS
+  v_carga NUMBER;
+BEGIN
+  SELECT COUNT(*)
+    INTO v_carga
+    FROM FIDE_INCIDENTE_TB I
+    JOIN FIDE_ESTADO_INCIDENTE_TB E ON E.ID_ESTADO_INCIDENTE = I.ID_ESTADO_INCIDENTE
+   WHERE I.ID_USUARIO_ASIGNADO = p_id_usuario
+     AND E.ES_FINAL = 'N';
+  RETURN v_carga;
+END FIDE_CARGA_ANALISTA_FN;
+/
+
+-- rn-02: analista activo con menor carga y capacidad disponible
+CREATE OR REPLACE FUNCTION FIDE_OBTENER_ANALISTA_FN RETURN NUMBER IS
+  v_id_usuario FIDE_USUARIO_TB.ID_USUARIO%TYPE;
+BEGIN
+  SELECT ID_USUARIO
+    INTO v_id_usuario
+    FROM (
+      SELECT U.ID_USUARIO, U.CAPACIDAD_MAXIMA, FIDE_CARGA_ANALISTA_FN(U.ID_USUARIO) AS CARGA
+        FROM FIDE_USUARIO_TB U
+        JOIN FIDE_ROL_TB R ON R.ID_ROL = U.ID_ROL
+       WHERE R.NOMBRE_ROL = 'Analista'
+         AND U.ID_ESTADO = 1
+    )
+   WHERE CARGA < CAPACIDAD_MAXIMA
+   ORDER BY CARGA, ID_USUARIO
+   FETCH FIRST 1 ROWS ONLY;
+  RETURN v_id_usuario;
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    RETURN NULL;
+END FIDE_OBTENER_ANALISTA_FN;
+/
+
+-- supervisor activo que recibe las alertas
+CREATE OR REPLACE FUNCTION FIDE_OBTENER_SUPERVISOR_FN RETURN NUMBER IS
+  v_id_usuario FIDE_USUARIO_TB.ID_USUARIO%TYPE;
+BEGIN
+  SELECT U.ID_USUARIO
+    INTO v_id_usuario
+    FROM FIDE_USUARIO_TB U
+    JOIN FIDE_ROL_TB R ON R.ID_ROL = U.ID_ROL
+   WHERE R.NOMBRE_ROL = 'Supervisor'
+     AND U.ID_ESTADO = 1
+   ORDER BY U.ID_USUARIO
+   FETCH FIRST 1 ROWS ONLY;
+  RETURN v_id_usuario;
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    RETURN NULL;
+END FIDE_OBTENER_SUPERVISOR_FN;
+/
+
+-- rn-04: indica si la transicion esta permitida
+CREATE OR REPLACE FUNCTION FIDE_VALIDAR_TRANSICION_FN (
+  p_id_origen  IN NUMBER,
+  p_id_destino IN NUMBER
+) RETURN VARCHAR2 IS
+  v_existe NUMBER;
+BEGIN
+  SELECT COUNT(*)
+    INTO v_existe
+    FROM FIDE_TRANSICION_ESTADO_TB
+   WHERE ID_ESTADO_ORIGEN = p_id_origen
+     AND ID_ESTADO_DESTINO = p_id_destino;
+  RETURN CASE WHEN v_existe > 0 THEN 'S' ELSE 'N' END;
+END FIDE_VALIDAR_TRANSICION_FN;
+/
+
+-- cantidad de controles aplicados a un incidente
+CREATE OR REPLACE FUNCTION FIDE_CONTAR_CONTROLES_FN (
+  p_id_incidente IN NUMBER
+) RETURN NUMBER IS
+  v_total NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO v_total FROM FIDE_INCIDENTE_CONTROL_TB WHERE ID_INCIDENTE = p_id_incidente;
+  RETURN v_total;
+END FIDE_CONTAR_CONTROLES_FN;
+/
+
+-- fecha limite del sla de respuesta o resolucion
+CREATE OR REPLACE FUNCTION FIDE_FECHA_LIMITE_SLA_FN (
+  p_id_incidente IN NUMBER,
+  p_tipo_sla     IN VARCHAR2
+) RETURN TIMESTAMP IS
+  v_limite TIMESTAMP;
+BEGIN
+  SELECT I.FECHA_REGISTRO + NUMTODSINTERVAL(
+           CASE WHEN UPPER(p_tipo_sla) = 'RESPUESTA' THEN S.HORAS_RESPUESTA ELSE S.HORAS_RESOLUCION END, 'HOUR')
+    INTO v_limite
+    FROM FIDE_INCIDENTE_TB I
+    JOIN FIDE_SEVERIDAD_TB S ON S.ID_SEVERIDAD = I.ID_SEVERIDAD
+   WHERE I.ID_INCIDENTE = p_id_incidente;
+  RETURN v_limite;
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    RETURN NULL;
+END FIDE_FECHA_LIMITE_SLA_FN;
+/
+
+-- estado del sla de un incidente para reportes
+CREATE OR REPLACE FUNCTION FIDE_ESTADO_SLA_FN (
+  p_id_incidente IN NUMBER
+) RETURN VARCHAR2 IS
+  v_estado   FIDE_ESTADO_INCIDENTE_TB.NOMBRE_ESTADO%TYPE;
+  v_es_final FIDE_ESTADO_INCIDENTE_TB.ES_FINAL%TYPE;
+  v_ahora    TIMESTAMP := FIDE_AHORA_FN;
+BEGIN
+  SELECT E.NOMBRE_ESTADO, E.ES_FINAL
+    INTO v_estado, v_es_final
+    FROM FIDE_INCIDENTE_TB I
+    JOIN FIDE_ESTADO_INCIDENTE_TB E ON E.ID_ESTADO_INCIDENTE = I.ID_ESTADO_INCIDENTE
+   WHERE I.ID_INCIDENTE = p_id_incidente;
+
+  IF v_es_final = 'S' THEN
+    RETURN 'CERRADO';
+  ELSIF v_ahora > FIDE_FECHA_LIMITE_SLA_FN(p_id_incidente, 'RESOLUCION') THEN
+    RETURN 'RESOLUCION VENCIDA';
+  ELSIF v_estado = 'Abierto' AND v_ahora > FIDE_FECHA_LIMITE_SLA_FN(p_id_incidente, 'RESPUESTA') THEN
+    RETURN 'RESPUESTA VENCIDA';
+  END IF;
+  RETURN 'EN TIEMPO';
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    RETURN NULL;
+END FIDE_ESTADO_SLA_FN;
+/
+
+-- nombre del rol de un usuario activo
+CREATE OR REPLACE FUNCTION FIDE_ROL_USUARIO_FN (
+  p_id_usuario IN NUMBER
+) RETURN VARCHAR2 IS
+  v_rol FIDE_ROL_TB.NOMBRE_ROL%TYPE;
+BEGIN
+  SELECT R.NOMBRE_ROL
+    INTO v_rol
+    FROM FIDE_USUARIO_TB U
+    JOIN FIDE_ROL_TB R ON R.ID_ROL = U.ID_ROL
+   WHERE U.ID_USUARIO = p_id_usuario
+     AND U.ID_ESTADO = 1;
+  RETURN v_rol;
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    RETURN NULL;
+END FIDE_ROL_USUARIO_FN;
+/
+
+-- rf-01: valida credenciales y devuelve el id del usuario
+CREATE OR REPLACE FUNCTION FIDE_AUTENTICAR_FN (
+  p_nombre_usuario IN VARCHAR2,
+  p_contrasena     IN VARCHAR2
+) RETURN NUMBER IS
+  v_id_usuario FIDE_USUARIO_TB.ID_USUARIO%TYPE;
+  v_hash       FIDE_USUARIO_TB.CONTRASENA_HASH%TYPE;
+BEGIN
+  IF p_nombre_usuario IS NULL OR p_contrasena IS NULL OR LENGTH(p_contrasena) < 8 THEN
+    RAISE_APPLICATION_ERROR(FIDE_ERRORES_PKG.c_credenciales, 'usuario o contrasena incorrectos');
+  END IF;
+  SELECT ID_USUARIO, CONTRASENA_HASH
+    INTO v_id_usuario, v_hash
+    FROM FIDE_USUARIO_TB
+   WHERE LOWER(NOMBRE_USUARIO) = LOWER(p_nombre_usuario)
+     AND ID_ESTADO = 1;
+
+  IF v_hash <> FIDE_HASH_CONTRASENA_FN(p_nombre_usuario, p_contrasena) THEN
+    RAISE_APPLICATION_ERROR(FIDE_ERRORES_PKG.c_credenciales, 'usuario o contrasena incorrectos');
+  END IF;
+  RETURN v_id_usuario;
+EXCEPTION
+  WHEN NO_DATA_FOUND THEN
+    RAISE_APPLICATION_ERROR(FIDE_ERRORES_PKG.c_credenciales, 'usuario o contrasena incorrectos');
+END FIDE_AUTENTICAR_FN;
+/
+
+SELECT object_name, status FROM user_objects WHERE object_type = 'FUNCTION' ORDER BY object_name;
