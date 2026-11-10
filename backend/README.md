@@ -1,4 +1,4 @@
-# Cybershield - aplicacion de consola (Avance 2)
+# Cybershield - aplicacion de consola 
 
 Aplicacion interactiva de linea de comandos que consume la logica PL/SQL de Oracle Autonomous Database
 con python-oracledb en modo thin.
